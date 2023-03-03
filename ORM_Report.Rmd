@@ -1,0 +1,2602 @@
+---
+title: 'ORM'
+subtitle: 'Feb/2023'
+author: 'Gustavo Henrique S. Rodrigues (ghrodrigues@bracell.com)'
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true 
+    number_sections: true
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r logo, echo = FALSE}
+
+htmltools::img(src = knitr::image_uri("F:/Planejamento_e_Controle/Inventário Florestal/Planejamento/2022/4. Usuários/8. Gustavo Rodrigues/7. Auditoria/logo.png"), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width = "220px",
+               heigth = "220px")
+
+```
+
+```{r packages, warning = FALSE, ECHO = FALSE, message = FALSE, include = FALSE}
+rm(list = ls(all=T))
+graphics.off()
+
+knitr::opts_chunk$set(echo = FALSE, 
+                      message = FALSE,
+                      warning = FALSE,
+                      include = FALSE)
+
+load.lib = c('ggplot2', 'dplyr', 'rstatix', 'ggthemes', 'data.table', 'lubridate', 'DT', 'gridExtra', 'formattable', 
+             'stringr', 'readxl')
+
+install.lib = load.lib[!load.lib %in% installed.packages()]
+
+for(lib in install.lib) {
+  install.packages(lib, dependencies = TRUE)
+}
+
+sapply(load.lib, require, character = TRUE)
+
+setwd("F:/Planejamento_e_Controle/Inventário Florestal/Planejamento/2023/5. Usuários/3. Gustavo H/8. ORM")
+
+```
+
+```{r rawdata, warning=F, message=F}
+
+land <- read_excel(paste0(getwd(), "/Bracell Land monitoring SP - 31.12.2022.xlsx"), sheet = "31122022", skip = 2) %>%
+          as.data.frame() %>%
+          select(Id, id_uso_solo, Company_ID, Sector, `FARM NAME`, Landuse, Genetic, Ownership, Age, Area_Ha,
+                 Est_Date, Land2, Estado, Climática, YieldClass) %>%
+          mutate(Est_Date = replace(Est_Date, Est_Date == "-", NA),
+                 Est_Date = as_date(janitor::excel_numeric_to_date(as.numeric(Est_Date))),
+                 Age = as.numeric(Age),
+                 Index = paste(Id, year(Est_Date), sep = "_")) %>%
+          select(-Id)
+
+bd <- read_excel(paste0(getwd(), "/Base_Geral_v2_Schumacher.xlsx"), sheet = "BD", skip = 17) %>%
+            as.data.frame() %>%
+            select(Ano_Inv, Tipo_Informação, DATA_MEDICAO, TALHAO, `IDADE(anos)`, AMOSTRAS, `FUSTES/ha`, `ARVORES/ha`, 
+                   `COVAS/ha`, `DAP(cm)`, `ALTURA_MEDIA (m)`, `ALTURA_DOMINANTE (m)`, `AREA_BASAL(m²/ha)`, 
+                   `VOLUME_INDIVIDUAL (m³/árvore)`, `VOLUME(m³csc/ha)`, Index, AREA) %>%
+            mutate(DATA_MEDICAO = as_date(DATA_MEDICAO))
+
+names(bd) <- c("Inventory.Year", "Source", "Measurement.Date", "Stands", "Inventory.Age", "Plots", "Steems", "Trees", "Pits", 
+               "DBH", "Mean.Height", "Dominant.Height", "Basal.Area", "Individual.Volume", "Volume.ub", "Index", "Area")
+bd.b <- bd %>%
+        left_join(land, by = "Index")
+
+bd <- bd %>% 
+        select(-c("Area")) %>%
+        left_join(land, by = "Index")
+```
+
+```{r rawdataselected, warning=F, message=F}
+
+bd2023 <- bd %>% 
+            filter(year(Measurement.Date) == 2023)
+
+potencial <- data.frame(YieldClass = c(seq(12,1,-1), "CZ1", "CZ2", "CZ3"),
+                        LRP.MAI = c(28.33,31.67,35,38.33,41.67,45,48.33,51.67,55,58.33,61.67,65, 44.5,43.4,43))
+
+bdanterior <- bd %>% 
+                filter(year(Measurement.Date) != 2023) %>% 
+                filter(Index %in% bd2023$Index) %>% 
+                group_by(Index) %>% 
+                slice_max(Measurement.Date) %>%
+                ungroup() %>%
+                as.data.frame() %>%
+                select(-c("Stands", "Company_ID", "Sector", "FARM NAME", "Landuse", "Genetic", "YieldClass",
+                          "Ownership", "Age", "Area_Ha", "Est_Date", "Land2", "Estado", "Climática", "Index"))
+
+bd2023 <- bd2023 %>%
+            left_join(bdanterior, by = "id_uso_solo",
+                      suffix = c(".Current", ".Previous")) %>%
+            mutate(Genetic = replace(Genetic, is.na(Genetic), "-")) %>% 
+            filter(!duplicated(id_uso_solo)) %>%
+            left_join(potencial, by = "YieldClass")
+
+eq_vol <- read_excel(paste0(getwd(), "/Eq_projecao.xlsx")) %>%
+            as.data.frame()
+
+bd2023$ID_projeção <- ifelse(bd2023$Genetic %in% unique(eq_vol$Material_Genetico),
+                             paste(bd2023$Genetic, bd2023$Landuse, sep = "-"),
+                             paste("-", bd2023$Landuse, sep = "-"))
+
+for(i in 1:nrow(bd2023)) {
+  if(bd2023$ID_projeção[i] %in% unique(eq_vol$Estrato_MG_REGIME)) {
+   next
+  } else {
+    bd2023$ID_projeção[i] <- paste("-", bd2023$Landuse[i], sep = "-")
+  }
+}
+
+bd2023 <- bd2023 %>%
+            left_join(eq_vol %>% 
+                        select(Estrato_MG_REGIME, Equação), 
+                        by = c("ID_projeção" = "Estrato_MG_REGIME"))
+
+bd2023$Volume.6years.current <- NA
+bd2023$Volume.7years.current <- NA
+bd2023$Volume.6years.previous <- NA
+bd2023$Volume.7years.previous <- NA
+bd2023$MAI6.current <- NA
+bd2023$MAI7.current <- NA
+bd2023$MAI6.previous <- NA
+bd2023$MAI7.previous <- NA
+
+for(i in 1:nrow(bd2023)) {
+  eqsc <- parse(text = bd2023$Equação[i])
+  Idade_1 <- bd2023$Inventory.Age.Current[i] * 12
+  Idade_2 <- 72
+  Vsc <- bd2023$Volume.ub.Current[i]
+  bd2023$Volume.6years.current[i] <- round(eval(eqsc), 2)
+  
+  Idade_2 <- 84
+  bd2023$Volume.7years.current[i] <- round(eval(eqsc), 2)
+  
+  if(is.na(bd2023$Inventory.Age.Previous[i])) {
+    bd2023$Volume.6years.previous[i] <- NA
+    bd2023$Volume.7years.previous[i] <- NA
+  } else {
+    Idade_1 <- bd2023$Inventory.Age.Previous[i] * 12
+    Idade_2 <- 72
+    Vsc <- bd2023$Volume.ub.Previous[i]
+    bd2023$Volume.6years.previous[i] <- round(eval(eqsc), 2)
+    
+    Idade_2 <- 84
+    bd2023$Volume.7years.previous[i] <- round(eval(eqsc), 2)
+  }
+  
+  bd2023$Volume.6years.current[i] <- ifelse(bd2023$Inventory.Age.Current[i] >=6, bd2023$Volume.ub.Current[i], bd2023$Volume.6years.current[i])
+  bd2023$Volume.7years.current[i] <- ifelse(bd2023$Inventory.Age.Current[i] >=7, bd2023$Volume.ub.Current[i], bd2023$Volume.7years.current[i])
+  bd2023$Volume.6years.previous[i] <- ifelse(bd2023$Inventory.Age.Previous[i] >=6, bd2023$Volume.ub.Previous[i], bd2023$Volume.6years.previous[i])
+  bd2023$Volume.7years.previous[i] <- ifelse(bd2023$Inventory.Age.Previous[i] >=7, bd2023$Volume.ub.Previous[i], bd2023$Volume.7years.previous[i])
+  
+  bd2023$MAI6.current[i] <- ifelse(bd2023$Inventory.Age.Current[i] >= 6, round(bd2023$Volume.6years.current[i] / bd2023$Inventory.Age.Current[i],2), 
+                                   round(bd2023$Volume.6years.current[i] / 6, 2))
+  bd2023$MAI7.current[i] <- ifelse(bd2023$Inventory.Age.Current[i] >= 7, round(bd2023$Volume.7years.current[i] / bd2023$Inventory.Age.Current[i],2), 
+                                   round(bd2023$Volume.7years.current[i] / 7, 2))
+  bd2023$MAI6.previous[i] <- ifelse(bd2023$Inventory.Age.Previous[i] >= 6, round(bd2023$Volume.6years.previous[i] / bd2023$Inventory.Age.Previous[i],2), 
+                                    round(bd2023$Volume.6years.previous[i] / 6, 2))
+  bd2023$MAI7.previous[i] <- ifelse(bd2023$Inventory.Age.Previous[i] >= 7, round(bd2023$Volume.7years.previous[i] / bd2023$Inventory.Age.Previous[i],2), 
+                                    round(bd2023$Volume.7years.previous[i] / 7, 2))
+
+}
+
+bd2023 <- bd2023 %>% 
+            select(-c("ID_projeção", "Equação")) %>%
+            mutate(Volume.real.current.Area = Volume.ub.Current * Area_Ha,
+                   Volume.real.previous.Area = Volume.ub.Previous * Area_Ha,
+                   Volume.6years.current.Area = Volume.6years.current * Area_Ha, 
+                   Volume.7years.current.Area = Volume.7years.current * Area_Ha, 
+                   Volume.6years.previous.Area = Volume.6years.previous * Area_Ha, 
+                   Volume.7years.previous.Area = Volume.7years.previous * Area_Ha, 
+                   MAI6.current.Area = MAI6.current * Area_Ha, 
+                   MAI7.current.Area = MAI7.current * Area_Ha, 
+                   MAI6.previous.Area = MAI6.previous * Area_Ha, 
+                   MAI7.previous.Area = MAI7.previous * Area_Ha,
+                   Inventory.Age.Current.Area = Inventory.Age.Current * Area_Ha,
+                   Inventory.Age.previous.Area = Inventory.Age.Previous * Area_Ha, 
+                   Increment.percent = ((Volume.ub.Current - Volume.ub.Previous) / Volume.ub.Previous) * 100,
+                   MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                   Increment.percent.Area = Increment.percent * Area_Ha,
+                   MAI6.deviation.Area = MAI6.deviation * Area_Ha,
+                   LRP.MAI.Area = LRP.MAI * Area_Ha)
+
+```
+
+```{r projectdata, warning=F, message=F}
+
+bd_projeto <-  bd2023 %>%
+                filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                group_by(Ownership, Land2, Landuse, `FARM NAME`, Climatic = Climática, Planting.year = year(Est_Date), Source.Previous, Source.Current) %>%
+                summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                          Previous.plots = sum(Plots.Previous, na.rm = T),
+                          Current.plots = sum(Plots.Current, na.rm = T),
+                          Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                          Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                          Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                          Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                          Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                          Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                          MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                          MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                          MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                          MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                          LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                          Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                          MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                          MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                          Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                          MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)
+                          ) %>%
+                as.data.frame() %>%
+                mutate_if(is.numeric, ~round(.,2)) %>%
+                mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+                mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Source.Previous), NA)) %>%
+                select(-c(Increment.percent.Area, MAI6.deviation.Area))
+
+bd_projeto2 <- bd2023 %>%
+                filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                mutate(Mes = month(Measurement.Date.Current)) %>%
+                filter(Mes == 1) %>%
+                # filter(INDEX_TOP7 %in% aux$INDEX_TOP7) %>%
+                group_by(Landuse, `FARM NAME`, Planting.year = year(Est_Date), Source.Previous, Source.Current) %>%
+                summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                          Previous.plots = sum(Plots.Previous, na.rm = T),
+                          Current.plots = sum(Plots.Current, na.rm = T),
+                          Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                          Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                          Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                          Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                          Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                          Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                          MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                          MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                          MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                          MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                          Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                          MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                          MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                          LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                          Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                          MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)
+                        ) %>%
+              as.data.frame() %>%
+              mutate_if(is.numeric, ~round(.,2)) %>%
+              mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+              mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Source.Previous), NA)) %>%
+              mutate_at(c("Increment.percent.Area", "MAI6.deviation.Area"), ~replace(.,is.na(Source.Previous), NA)) %>%
+              select(Landuse, `FARM NAME`, Planting.year, Area_Ha, Source.Previous, Source.Current,
+                     Previous.plots, Current.plots, Inventory.Age.previous, Inventory.Age.current,
+                     Volume.real.previous, Volume.real.current, MAI6.previous, MAI6.current, LRP.MAI,
+                     Increment.percent, MAI6.deviation)
+
+aux <- bd_projeto %>%
+        # filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+        # group_by(Landuse, `FARM NAME`) %>%
+        # summarise(Area = sum(Area_Ha)) %>%
+        # ungroup() %>%
+        arrange(Climatic, desc(MAI6.current), Landuse) %>%
+        group_by(Climatic, Landuse) %>%
+        slice_head(n = 3) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Climatic, Landuse, `FARM NAME`, sep = "-"))
+
+bd_projeto <-  bd2023 %>%
+                filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                group_by(Ownership, Land2, Landuse, `FARM NAME`, Planting.year = year(Est_Date), Source.Previous, Source.Current) %>%
+                summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                          Previous.plots = sum(Plots.Previous, na.rm = T),
+                          Current.plots = sum(Plots.Current, na.rm = T),
+                          Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                          Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                          Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                          Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                          Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                          Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                          MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                          MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                          MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                          MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                          LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                          Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                          MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                          MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                          Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                          MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)
+                          ) %>%
+                as.data.frame() %>%
+                mutate_if(is.numeric, ~round(.,2)) %>%
+                mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+                mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Source.Previous), NA)) %>%
+                select(-c(Increment.percent.Area, MAI6.deviation.Area))
+
+bd_projeto3 <- bd2023 %>%
+                filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                mutate(INDEX_TOP = paste(Climática, Landuse, `FARM NAME`, sep = "-")) %>%
+                filter(INDEX_TOP %in% aux$INDEX_TOP) %>%
+                group_by(Landuse, `FARM NAME`, Planting.year = year(Est_Date), Source.Previous, Source.Current) %>%
+                summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                          Previous.plots = sum(Plots.Previous, na.rm = T),
+                          Current.plots = sum(Plots.Current, na.rm = T),
+                          Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                          Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                          Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                          Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                          Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                          Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                          MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                          MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                          MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                          MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                          Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                          MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                          MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                          LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                          Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                          MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)
+                        ) %>%
+              as.data.frame() %>%
+              mutate_if(is.numeric, ~round(.,2)) %>%
+              mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+              mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Source.Previous), NA)) %>%
+              mutate_at(c("Increment.percent.Area", "MAI6.deviation.Area"), ~replace(.,is.na(Source.Previous), NA)) %>%
+              select(Landuse, `FARM NAME`, Planting.year, Area_Ha, Source.Previous, Source.Current,
+                     Previous.plots, Current.plots, Inventory.Age.previous, Inventory.Age.current,
+                     Volume.real.previous, Volume.real.current, MAI6.previous, MAI6.current, LRP.MAI,
+                     Increment.percent, MAI6.deviation)
+
+```
+
+```{r climatedata, warning=F, message=F}
+
+bd_cz <-  bd2023 %>%
+            filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(Landuse, Climatic = Climática, Planting.year = year(Est_Date)) %>%
+            summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                      Previous.plots = sum(Plots.Previous, na.rm = T),
+                      Current.plots = sum(Plots.Current, na.rm = T),
+                      Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                      Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                      Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                      Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                      Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                      Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                      Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                      Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                      MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                      MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                      MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                      MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                      LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                      Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                      MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                      MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100, 
+                      Previous.plots = replace(Previous.plots, Previous.plots == 0, NA), 
+                      Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                      MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)) %>%
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(.,2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Previous.plots), NA)) %>%
+            mutate_at(c("Increment.percent.Area", "MAI6.deviation.Area"), ~replace(.,is.na(Previous.plots), NA)) %>%
+            #filter(Planting.year >= 2017) %>%
+            select(Landuse, Climatic, Planting.year, Area_Ha, Previous.plots, Current.plots, 
+                   Inventory.Age.previous, Inventory.Age.current, Volume.real.previous, 
+                   Volume.real.current, MAI6.previous, MAI6.current, LRP.MAI,
+                   Increment.percent, MAI6.deviation)
+```
+
+```{r plantingyeardata, warning=F, message=F}
+
+bd_plan.yr <-  bd2023 %>%
+                filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                group_by(Landuse, Planting.year = year(Est_Date)) %>%
+                summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                          Previous.plots = sum(Plots.Previous, na.rm = T),
+                          Current.plots = sum(Plots.Current, na.rm = T),
+                          Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                          Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                          Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                          Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                          Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                          Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                          Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                          MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                          MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                          MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                          MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                          LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                          Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                          MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                          MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                          Previous.plots = replace(Previous.plots, Previous.plots == 0, NA), 
+                          Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                          MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)) %>%
+                as.data.frame() %>%
+                mutate_if(is.numeric, ~round(.,2)) %>%
+                mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+                mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Previous.plots), NA)) %>%
+                mutate_at(c("Increment.percent.Area", "MAI6.deviation.Area"), ~replace(.,is.na(Previous.plots), NA)) %>%
+                #filter(Planting.year >= 2017) %>%
+                select(Landuse, Planting.year, Area_Ha, Previous.plots, Current.plots, 
+                       Inventory.Age.previous, Inventory.Age.current, Volume.real.previous, 
+                       Volume.real.current, MAI6.previous, MAI6.current, LRP.MAI, 
+                       Increment.percent, MAI6.deviation)
+```
+
+```{r geneticdata, warning=F, message=F}
+bd_genetic <-  bd2023 %>%
+                  filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+                  group_by(Landuse, Genetic, Planting.year = year(Est_Date)) %>%
+                  summarise(Area_Ha = sum(Area_Ha, na.rm = T),
+                            Previous.plots = sum(Plots.Previous, na.rm = T),
+                            Current.plots = sum(Plots.Current, na.rm = T),
+                            Inventory.Age.previous = sum(Inventory.Age.previous.Area, na.rm = T) / Area_Ha,
+                            Inventory.Age.current = sum(Inventory.Age.Current.Area, na.rm = T) / Area_Ha,
+                            Volume.real.previous = sum(Volume.real.previous.Area, na.rm = T) / Area_Ha,
+                            Volume.real.current = sum(Volume.real.current.Area, na.rm = T) / Area_Ha,
+                            Volume.6years.previous = sum(Volume.6years.previous.Area, na.rm = T) / Area_Ha, 
+                            Volume.6years.current = sum(Volume.6years.current.Area, na.rm = T)/ Area_Ha,
+                            Volume.7years.previous = sum(Volume.7years.previous.Area, na.rm = T) / Area_Ha,
+                            Volume.7years.current = sum(Volume.7years.current.Area, na.rm = T) / Area_Ha, 
+                            MAI6.previous = sum(MAI6.previous.Area, na.rm = T) / Area_Ha,
+                            MAI6.current = sum(MAI6.current.Area, na.rm = T) / Area_Ha,
+                            MAI7.previous = sum(MAI7.previous.Area, na.rm = T) / Area_Ha,
+                            MAI7.current = sum(MAI7.current.Area, na.rm = T) / Area_Ha,
+                            LRP.MAI = sum(LRP.MAI.Area, na.rm = T) / Area_Ha,
+                            Increment.percent = ((Volume.real.current - Volume.real.previous) / Volume.real.previous) * 100,
+                            MAI6.deviation = ((MAI6.current - MAI6.previous) / MAI6.previous) * 100,
+                            MAI7.deviation = ((MAI7.current - MAI7.previous) / MAI7.previous) * 100,
+                            Previous.plots = replace(Previous.plots, Previous.plots == 0, NA), 
+                            Increment.percent.Area = sum(Increment.percent.Area, na.rm = T),
+                            MAI6.deviation.Area = sum(MAI6.deviation.Area, na.rm = T)) %>%
+              as.data.frame() %>%
+              mutate_if(is.numeric, ~round(.,2)) %>%
+              mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+              mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(Previous.plots), NA)) %>%
+              mutate_at(c("Increment.percent.Area", "MAI6.deviation.Area"), ~replace(.,is.na(Previous.plots), NA)) %>%
+              #filter(Planting.year >= 2017) %>%
+              select(Landuse, Genetic, Planting.year, Area_Ha, Previous.plots, Current.plots, 
+                     Inventory.Age.previous, Inventory.Age.current, Volume.real.previous, 
+                     Volume.real.current, MAI6.previous, MAI6.current, LRP.MAI, 
+                     Increment.percent, MAI6.deviation)
+```
+
+```{r generaldata, include = F}
+
+land <- read_excel(paste0(getwd(), "/Summary Report _ Fevereiro23_v1.xlsx"), sheet = "Land_Monitoring", skip = 1) %>%
+          as.data.frame() %>%
+          filter(PROJECT != "MS", Plant_Year <= 2021) %>%
+          select(Index, Sector, `FARM NAME`, Landuse, Genetic, Ownership, Area_Ha, Plant_Year, Est_Date,
+                 Climática, YieldClass, Land2) %>%
+          mutate(Est_Date = as_date(Est_Date),
+                 Age = round(as.numeric(as_date("2022-12-31") - Est_Date) / 365.25, 2),
+                 Med_est_1 = paste(Sector, Plant_Year, sep = "_"),
+                 Med_est_2 = paste0("2-", Plant_Year),
+                 Tab_prod_1 = paste0(Genetic,"-", Landuse,"-", Plant_Year,"_", round(Age, 0)),
+                 Tab_prod_2 = paste0(Landuse, " - Geral_", round(Age, 0)))
+
+bdinv <- bd.b %>% 
+                filter(Index %in% land$Index) %>% 
+                group_by(Index) %>% 
+                slice_max(Measurement.Date) %>%
+                ungroup() %>%
+                group_by(Index) %>% 
+                slice_max(Inventory.Year) %>%
+                ungroup() %>%
+                group_by(Index) %>% 
+                slice_max(Volume.ub) %>%
+                ungroup() %>%
+                as.data.frame() %>%
+                mutate(Info_type = "Forest Inventory")
+
+land <- land %>% 
+            left_join(bdinv %>%
+                          select(Index, Inventory.Age, Volume.ub, Info_type), by = "Index") %>%
+            mutate(Age = Inventory.Age)
+
+aux <- land %>% filter(is.na(Volume.ub))
+
+bdinv <- bd.b %>%
+            mutate(Med_est_1 = paste(str_sub(bd.b$Stands,start = 1, end = 4), str_sub(Index, start = -4), sep = "_"),
+                   Volume.ub.Area = Volume.ub * Area,
+                   Age.Area = Inventory.Age * Area) %>%
+            group_by(Med_est_1, year = year(as_date(Measurement.Date))) %>%
+            summarise(Area = sum(Area, na.rm = T),
+                      Volume.ub = round(sum(Volume.ub.Area, na.rm = T) / Area, 2),
+                      Inventory.Age = round(sum(Age.Area, na.rm = T) / Area, 2)) %>%
+            group_by(Med_est_1) %>%
+            slice_max(year) %>%
+            ungroup() %>%
+            filter(Med_est_1 %in% unique(aux$Med_est_1)) %>%
+            as.data.frame() %>%
+            rename("Volume.ub.med.est.1" = "Volume.ub",
+                   "Inventory.Age.med.est.1" = "Inventory.Age") %>%
+            select(-c(Area, year)) %>%
+            mutate(Info_type.med.est.1 = "Med. Est. 1")
+            
+land <- land %>%
+          left_join(bdinv, by = "Med_est_1")
+
+aux <- land %>% filter(is.na(Volume.ub.med.est.1) & is.na(Volume.ub) & Med_est_2 == "2-2021")
+
+bdinv <- bd.b %>%
+            mutate(Med_est_2 = paste("2", str_sub(Index, start = -4), sep = "-"),
+                   Volume.ub.Area = Volume.ub * Area,
+                   Age.Area = Inventory.Age * Area,
+                   year = year(as_date(Measurement.Date))) %>%
+            filter(year == 2023, Index %in% unique(land[land$Plant_Year == 2021,]$Index)) %>%
+            group_by(Med_est_2, year) %>%
+            summarise(Area = sum(Area, na.rm = T),
+                      Volume.ub = round(sum(Volume.ub.Area, na.rm = T) / Area, 2),
+                      Inventory.Age = round(sum(Age.Area, na.rm = T) / Area, 2)) %>%
+            as.data.frame() %>%
+            rename("Volume.ub.med.est.2" = "Volume.ub",
+                   "Inventory.Age.med.est.2" = "Inventory.Age") %>%
+            mutate(Inventory.Age.med.est.2 = 2,
+                   Info_type.med.est.2 = "Med. Est. 2") %>%
+            select(-c(Area, year)) 
+
+aux <- aux %>% left_join(bdinv, by = "Med_est_2")
+
+land <- land %>% 
+          left_join(aux %>%
+                      select(Index, Volume.ub.med.est.2, Inventory.Age.med.est.2, Info_type.med.est.2), by = "Index")
+
+aux <- land %>% filter(is.na(Volume.ub.med.est.1) & is.na(Volume.ub) & is.na(Volume.ub.med.est.2))
+
+tab.prod <- read_excel(paste0(getwd(), "/Summary Report _ Fevereiro23_v1.xlsx"), sheet = "Tabela_Produção", skip = 1) %>%
+              as.data.frame() 
+
+bdinv <- tab.prod %>%
+              rename("Tab_prod_1" = "index",
+                     "Info_type.tab.prod.1" = "Tipo_Informação",
+                     "Volume.ub.tab.prod.1" = "Volume_sc",
+                     "Inventory.Age.tab.prod.1" = "Idade") %>%
+              filter(Tab_prod_1 %in% unique(aux$Tab_prod_1)) %>%
+              select(Tab_prod_1, Info_type.tab.prod.1, Volume.ub.tab.prod.1, Inventory.Age.tab.prod.1)
+
+land <- land %>% 
+          left_join(bdinv, by = "Tab_prod_1")
+
+aux <- land %>% filter(is.na(Volume.ub.med.est.1) & is.na(Volume.ub) & is.na(Volume.ub.med.est.2) & is.na(Volume.ub.tab.prod.1))
+
+bdinv <- tab.prod %>% 
+           rename("Tab_prod_2" = "index",
+                  "Info_type.tab.prod.2" = "Tipo_Informação",
+                  "Volume.ub.tab.prod.2" = "Volume_sc",
+                  "Inventory.Age.tab.prod.2" = "Idade") %>%
+           filter(Tab_prod_2 %in% unique(aux$Tab_prod_2)) %>%
+           select(Tab_prod_2, Info_type.tab.prod.2, Volume.ub.tab.prod.2, Inventory.Age.tab.prod.2) %>%
+           mutate(Info_type.tab.prod.2 = "Tab. Prod. 2")
+
+land <- land %>%
+          left_join(bdinv, by = "Tab_prod_2")
+
+land$Info_Type <- ifelse(!is.na(land$Info_type), land$Info_type,
+                         ifelse(!is.na(land$Info_type.med.est.1), land$Info_type.med.est.1,
+                                ifelse(!is.na(land$Info_type.med.est.2), land$Info_type.med.est.2,
+                                       ifelse(!is.na(land$Info_type.tab.prod.1), land$Info_type.tab.prod.1,
+                                              ifelse(!is.na(land$Info_type.tab.prod.2), land$Info_type.tab.prod.2, "-")))))
+
+land$Volume_ub_final <- ifelse(!is.na(land$Volume.ub), land$Volume.ub,
+                         ifelse(!is.na(land$Volume.ub.med.est.1), land$Volume.ub.med.est.1,
+                                ifelse(!is.na(land$Volume.ub.med.est.2), land$Volume.ub.med.est.2,
+                                       ifelse(!is.na(land$Volume.ub.tab.prod.1), land$Volume.ub.tab.prod.1,
+                                              ifelse(!is.na(land$Volume.ub.tab.prod.2), land$Volume.ub.tab.prod.2, "-")))))
+
+land$Age_final <- ifelse(!is.na(land$Age), land$Age,
+                         ifelse(!is.na(land$Inventory.Age.med.est.1), land$Inventory.Age.med.est.1,
+                                ifelse(!is.na(land$Inventory.Age.med.est.2), land$Inventory.Age.med.est.2,
+                                       ifelse(!is.na(land$Inventory.Age.tab.prod.1), land$Inventory.Age.tab.prod.1,
+                                              ifelse(!is.na(land$Inventory.Age.tab.prod.2), land$Inventory.Age.tab.prod.2, "-")))))
+land <- land %>% 
+          select(Index, `FARM NAME`, Landuse, Genetic, Ownership, Area_Ha, Plant_Year,
+                 Est_Date, Climática, YieldClass, Land2, Info_Type, Volume_ub_final, Age_final)
+
+land <- land %>%
+          left_join(potencial, by = "YieldClass")  
+  
+land$ID_projeção <- ifelse(land$Genetic %in% unique(eq_vol$Material_Genetico), 
+                           paste(land$Genetic, land$Landuse, sep = "-"),
+                           paste("-", land$Landuse, sep = "-"))
+
+for(i in 1:nrow(land)) {
+  if(land$ID_projeção[i] %in% unique(eq_vol$Estrato_MG_REGIME)) {
+   next
+  } else {
+    land$ID_projeção[i] <- paste("-", land$Landuse[i], sep = "-")
+  }
+}
+
+land <- land %>%
+            left_join(eq_vol %>% 
+                        select(Estrato_MG_REGIME, Equação), 
+                        by = c("ID_projeção" = "Estrato_MG_REGIME")) %>%
+            filter(Info_Type != "-")
+
+land$Volume.6years <- NA
+land$Volume.7years <- NA
+land$MAI6 <- NA
+land$MAI7 <- NA
+land$Age_final <- as.numeric(land$Age_final)
+
+for(i in 1:nrow(land)) {
+  eqsc <- parse(text = land$Equação[i])
+  Idade_1 <- land$Age_final[i] * 12
+  Idade_2 <- 72
+  Vsc <- as.numeric(land$Volume_ub_final[i])
+  land$Volume.6years[i] <- round(eval(eqsc), 2)
+  
+  Idade_2 <- 84
+  land$Volume.7years[i] <- round(eval(eqsc), 2)
+  
+  land$Volume.6years[i] <- ifelse(land$Age_final[i] >=6, land$Volume_ub_final[i], land$Volume.6years[i])
+  land$Volume.7years[i] <- ifelse(land$Age_final[i] >=7, land$Volume_ub_final[i], land$Volume.7years[i])
+  
+  land$MAI6[i] <- ifelse(land$Age_final[i] >= 6, round(as.numeric(land$Volume.6years[i]) / land$Age_final[i],2), 
+                                   round(as.numeric(land$Volume.6years[i]) / 6, 2))
+  land$MAI7[i] <- ifelse(land$Age_final[i] >= 7, round(as.numeric(land$Volume.7years[i]) / land$Age_final[i],2), 
+                                   round(as.numeric(land$Volume.7years[i]) / 7, 2))
+}
+
+land <- land %>% 
+          select(-c("ID_projeção", "Equação")) %>%
+          mutate(Volume_ub_final = as.numeric(Volume_ub_final),
+                 Volume.6years = as.numeric(Volume.6years),
+                 Volume.7years = as.numeric(Volume.7years),
+                 Volume.real.Area = Volume_ub_final * Area_Ha,
+                 Volume.6years.Area = Volume.6years * Area_Ha, 
+                 Volume.7years.Area = Volume.7years * Area_Ha, 
+                 MAI6.Area = MAI6 * Area_Ha, 
+                 MAI7.Area = MAI7 * Area_Ha, 
+                 Inventory.Age.Area = Age_final * Area_Ha,
+                 LRP.MAI.Area = LRP.MAI * Area_Ha) %>%
+            rename("Climatic" = "Climática",
+                   "Area (ha)" = "Area_Ha", 
+                   "MAI6 (m³.ub/ha.yr)" = "MAI6",
+                   "MAI7 (m³.ub/ha.yr)" = "MAI7",
+                   "Inventory Age (yrs.old)" = "Age_final",
+                   "Volume - Real (m³.ub/ha)" = "Volume_ub_final",
+                   "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                   "Planting year" = "Plant_Year", 
+                   "Project" = "FARM NAME")
+```
+
+# Introduction {.tabset}
+## About {-}
+
+* Forest Inventory Report for analysis of increment in own areas by: Project, Climatic Region, Planting Year and Genetic Materials.
+
+## Raw Data {-}
+
+
+```{r rawdata2, include = TRUE}
+
+aux <- land %>%
+          select(-c("Volume.real.Area", "Volume.6years.Area", "Volume.7years.Area", "MAI6.Area", "MAI7.Area", "Inventory.Age.Area", "LRP.MAI.Area"))
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+## Checks {-}
+
+* The checks correspond to the inventory base of 2023.
+
+> Total of Projects
+
+```{r checks1, include = TRUE}
+
+paste0(length(unique(bd2023$Sector)))
+
+```
+
+> Number of Projects without previous measurement
+
+```{r checks2, include = TRUE}
+
+aux <- bd2023 %>%
+        group_by(Sector) %>%
+        summarise(Volume = sum(Volume.ub.Previous)) %>%
+        filter(is.na(Volume))
+
+paste0(nrow(aux))
+
+```
+
+> Available Climatic Region
+
+```{r checks3, include = TRUE}
+
+sort(paste(unique(bd2023$Climática)))
+
+```
+
+> Available Planting Years
+
+```{r checks4, include = TRUE}
+
+sort(paste(unique(bd_projeto$Planting.year)))
+
+```
+
+> Available Genetic
+
+```{r checks5, include = TRUE}
+
+sort(paste(unique(bd2023$Genetic)))
+
+```
+
+## Advices {-}
+
+<div style="text-align: justify">
+
+* This Report does not include Purchase areas;
+
+* Values on report considered fields measurements collected until February/2023 at Forests with 2 years of age or up;
+
+* For new plantings the previous measurement will not be available;
+
+* For ages under 6 years old, the volumetric projections models were used; 
+
+* For ages above 6 years old, the actual age was taken into account for calculations.
+
+</div>
+# General
+
+* All farms in the forest inventory base were considered in this section;
+
+* Does not include Purchase areas.
+
+```{r generalowndata, include = F}
+
+land2 <- land %>% filter(Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase", Land2 != "Purchase/New Implantation")
+
+```
+
+
+## Planting Year {.tabset}
+### Assumptions {-}
+
+* For the calculation of total weighted averages of MAI6, only planting years equal to or greater than 2017 were used.
+
+### Table {-}
+
+```{r pytablegen, include = TRUE}
+
+plngen <- land2 %>%
+            group_by(`Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`, 
+                      `Inventory Age (yrs.old)` = sum(Inventory.Age.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(plngen$`Volume - Real (m³.ub/ha)` * plngen$`Area (ha)`, na.rm = T) / 
+                sum(plngen$`Area (ha)`),2)
+
+cm6 = round(sum(plngen$`MAI6 (m³.ub/ha.yr)` * plngen$`Area (ha)`* (plngen$`Planting year` >= 2017), na.rm = T) / 
+              sum(plngen[plngen$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(plngen$`LRP MAI (m³.ub/ha.yr)` * plngen$`Area (ha)`* (plngen$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plngen[plngen$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cid = round(sum(plngen$`Inventory Age (yrs.old)` * plngen$`Area (ha)`, na.rm = T) / 
+              sum(plngen$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plngen, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plngen)
+df2$`Planting year` <- "Total:"
+df2$`Area (ha)` <- sum(plngen$`Area (ha)`, na.rm = T)
+df2$`Inventory Age (yrs.old)` <- cid
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plngen, df2)
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6.
+
+</div>
+
+### Graphic {-}
+
+
+```{r pygraph1gen, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+plngen %>%
+        ggplot(aes(x = `Planting year`, y = `MAI6 (m³.ub/ha.yr)`, fill = "#A2BD30")) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        # geom_text(aes(y = match(Valor, sort(unique(Valor))), x = `Planting year`, 
+        #               label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+        #                              paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+        #           data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), y = 55,
+        #           color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        # facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(breaks = seq(1988, 2021,1)) +
+        scale_y_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#0054A4", "#A2BD30"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = F)) +
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Planting year") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "none",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Climatic {.tabset}
+### Assumptions {-}
+
+* For the calculation of total weighted averages of MAI6, only planting years equal to or greater than 2017 were used.
+
+### Table {-}
+
+```{r clitablegen, include = TRUE}
+
+plncli <- land2 %>%
+            group_by(Climatic, `Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`, 
+                      `Inventory Age (yrs.old)` = sum(Inventory.Age.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(plncli$`Volume - Real (m³.ub/ha)` * plncli$`Area (ha)`, na.rm = T) / 
+                sum(plncli$`Area (ha)`),2)
+
+cm6 = round(sum(plncli$`MAI6 (m³.ub/ha.yr)` * plncli$`Area (ha)`* (plncli$`Planting year` >= 2017), na.rm = T) / 
+              sum(plncli[plncli$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(plncli$`LRP MAI (m³.ub/ha.yr)` * plncli$`Area (ha)`* (plncli$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plncli[plncli$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cid = round(sum(plncli$`Inventory Age (yrs.old)` * plncli$`Area (ha)`, na.rm = T) / 
+              sum(plncli$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plncli, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plncli)
+df2$Climatic <- "Total:"
+df2$`Area (ha)` <- sum(plncli$`Area (ha)`, na.rm = T)
+df2$`Inventory Age (yrs.old)` <- cid
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plncli, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6.
+
+</div>
+
+### Graphic {-}
+
+
+```{r cligraph1gen, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+plncli %>%
+        filter(Climatic != "CZ4") %>%
+        ggplot(aes(y = Climatic, x = `MAI6 (m³.ub/ha.yr)`, fill = "#A2BD30")) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Climatic Region") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "none",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Landuse {.tabset}
+
+### Assumptions {-}
+
+### Table {-}
+
+```{r landtablegen, include = TRUE}
+
+plnland <- land2 %>%
+            group_by(Landuse, `Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`, 
+                      `Inventory Age (yrs.old)` = sum(Inventory.Age.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(plnland$`Volume - Real (m³.ub/ha)` * plnland$`Area (ha)`, na.rm = T) / 
+                sum(plnland$`Area (ha)`),2)
+
+cm6 = round(sum(plnland$`MAI6 (m³.ub/ha.yr)` * plnland$`Area (ha)`* (plnland$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnland[plnland$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(plnland$`LRP MAI (m³.ub/ha.yr)` * plnland$`Area (ha)`* (plnland$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plnland[plnland$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cid = round(sum(plnland$`Inventory Age (yrs.old)` * plnland$`Area (ha)`, na.rm = T) / 
+              sum(plnland$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnland, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnland)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(plnland$`Area (ha)`, na.rm = T)
+df2$`Inventory Age (yrs.old)` <- cid
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plnland, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6.
+
+</div>
+
+### Graphic {-}
+
+
+```{r landgraph1gen, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+plnland %>%
+        ggplot(aes(y = Landuse, x = `MAI6 (m³.ub/ha.yr)`, fill = "#A2BD30")) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Landuse") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "none",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Summary {.tabset}
+
+### Assumptions {-}
+
+* To the total weighted averages of information regarding the LRP and MAI6, only the information with a planting year equal or greater than 2017 was taken into account;
+
+* Coppice Landuse  was not taken into consideration for the information summaries.
+
+### Planting Year {-}
+
+```{r resumegeneral, include = T}
+
+plnres <- land2 %>%
+            filter(Landuse != "Coppice") %>%
+            group_by(`Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(plnres$`Volume - Real (m³.ub/ha)` * plnres$`Area (ha)`, na.rm = T) / 
+                sum(plnres$`Area (ha)`),2)
+
+cm6 = round(sum(plnres$`MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(plnres$`LRP MAI (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnres, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnres)
+df2$`Planting year` <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plnres, df2) %>% select(-"Volume - Real (m³.ub/ha)")
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+
+```
+
+
+### Climatic {-}
+
+```{r resumegeneral2, include = T}
+
+plnres <- land2 %>%
+            filter(Landuse != "Coppice") %>%
+            group_by(Climatic) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+aux <-  land2 %>%
+            filter(Landuse != "Coppice") %>%
+            group_by(Climatic, `Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(aux$`Volume - Real (m³.ub/ha)` * aux$`Area (ha)`, na.rm = T) / 
+                sum(aux$`Area (ha)`),2)
+
+cm6 = round(sum(aux$`MAI6 (m³.ub/ha.yr)` * aux$`Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+              sum(aux[aux$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(aux$`LRP MAI (m³.ub/ha.yr)` * aux$`Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+                 sum(aux[aux$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnres, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnres)
+df2$Climatic <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plnres, df2) %>% select(-"Volume - Real (m³.ub/ha)")
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+### Landuse {-}
+
+```{r resumegeneral3, include = T}
+
+plnres <- land2 %>%
+            filter(Landuse != "Coppice") %>%
+            group_by(Landuse) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+aux <-  land2 %>%
+            filter(Landuse != "Coppice") %>%
+            group_by(Landuse, `Planting year`) %>%
+            summarise(`Area (ha)` = sum(`Area (ha)`, na.rm = T),
+                      `Volume - Real (m³.ub/ha)` = sum(Volume.real.Area, na.rm = T) / `Area (ha)`,
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `MAI6 (m³.ub/ha.yr)` = sum(MAI6.Area, na.rm = T) /  `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2))
+
+c.v.r = round(sum(aux$`Volume - Real (m³.ub/ha)` * aux$`Area (ha)`, na.rm = T) / 
+                sum(aux$`Area (ha)`),2)
+
+cm6 = round(sum(aux$`MAI6 (m³.ub/ha.yr)` * aux$`Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+              sum(aux[aux$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+lrpm6  = round(sum(aux$`LRP MAI (m³.ub/ha.yr)` * aux$`Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+                 sum(aux[aux$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnres, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnres)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+
+aux <- rbind(plnres, df2) %>% select(-"Volume - Real (m³.ub/ha)")
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+# 2023 - Inventory Info
+
+## Projects 
+
+### Monthly {.tabset}
+#### Assumptions {-}
+
+* All farms measured in January/2023 have been selected;
+
+* The same farm may be present in one or more Landuse classes;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+#### Table {-}
+
+```{r projecttable, include = TRUE}
+
+bd_projeto2 <- bd_projeto2 %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year", "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+bd_projeto2$`Previous Source` <- ifelse(bd_projeto2$`Previous Source` == "IFC", "CFI", bd_projeto2$`Previous Source`)
+bd_projeto2$`Previous Source` <- ifelse(bd_projeto2$`Previous Source` == "IPC", "PHI", bd_projeto2$`Previous Source`)
+bd_projeto2$`Current Source` <- ifelse(bd_projeto2$`Current Source` == "IFC", "CFI", bd_projeto2$`Current Source`)
+bd_projeto2$`Current Source` <- ifelse(bd_projeto2$`Current Source` == "IPC", "PHI", bd_projeto2$`Current Source`)
+
+pr.v.r = round(sum(bd_projeto2$`Previous Volume - Real (m³.ub/ha)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2[!(is.na(bd_projeto2$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+c.v.r = round(sum(bd_projeto2$`Current Volume - Real (m³.ub/ha)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2$`Area (ha)`),2)
+pm6 = round(sum(bd_projeto2$`Previous MAI6 (m³.ub/ha.yr)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2[!(is.na(bd_projeto2$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cm6 = round(sum(bd_projeto2$`Current MAI6 (m³.ub/ha.yr)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2$`Area (ha)`),2)
+inc = round(sum(bd_projeto2$`Increment (%)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2[!(is.na(bd_projeto2$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+m6d = round(sum(bd_projeto2$`MAI6 Deviation (%)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2[!(is.na(bd_projeto2$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+pid = round(sum(bd_projeto2$`Previous Inventory Age (yrs.old)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2[!(is.na(bd_projeto2$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cid = round(sum(bd_projeto2$`Current Inventory Age (yrs.old)` * bd_projeto2$`Area (ha)`, na.rm = T) / sum(bd_projeto2$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_projeto2, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_projeto2)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_projeto2$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_projeto2$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_projeto2$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_projeto2, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* CFI = Continuous forest inventory;
+
+* PHI = Pré-Harvest forest inventory;
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+#### Graphic {-}
+
+* Only the top 5 highest IMA6 Current values were selected, considering the Landuse and Planting Year.
+
+> Coppice
+
+```{r projectgraph1, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto2 %>%
+        filter(Landuse == "Coppice") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_projeto2 %>%
+        filter(Landuse == "Coppice") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+        ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+> Implantation
+
+```{r projectgraph2, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto2 %>%
+        filter(Landuse == "Implantation") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_projeto2 %>%
+        filter(Landuse == "Implantation") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% aux$INDEX_TOP) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+        ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r projectgraph3, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto2 %>%
+        filter(Landuse == "Replanting") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_projeto2 %>%
+        filter(Landuse == "Replanting") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% aux$INDEX_TOP) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+        ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+### Year to Date {.tabset}
+#### Assumptions {-}
+
+* All owned farms measured until February/2023 have been selected;
+
+* The same farm may be present in one or more Landuse classes;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+#### Table {-}
+
+```{r projecttable2, include = TRUE}
+
+bd_projeto <- bd_projeto %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year", "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+bd_projeto$`Previous Source` <- ifelse(bd_projeto$`Previous Source` == "IFC", "CFI", bd_projeto$`Previous Source`)
+bd_projeto$`Previous Source` <- ifelse(bd_projeto$`Previous Source` == "IPC", "PHI", bd_projeto$`Previous Source`)
+bd_projeto$`Current Source` <- ifelse(bd_projeto$`Current Source` == "IFC", "CFI", bd_projeto$`Current Source`)
+bd_projeto$`Current Source` <- ifelse(bd_projeto$`Current Source` == "IPC", "PHI", bd_projeto$`Current Source`)
+
+pr.v.r = round(sum(bd_projeto$`Previous Volume - Real (m³.ub/ha)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto[!(is.na(bd_projeto$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+c.v.r = round(sum(bd_projeto$`Current Volume - Real (m³.ub/ha)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto$`Area (ha)`),2)
+pm6 = round(sum(bd_projeto$`Previous MAI6 (m³.ub/ha.yr)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto[!(is.na(bd_projeto$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cm6 = round(sum(bd_projeto$`Current MAI6 (m³.ub/ha.yr)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto$`Area (ha)`),2)
+inc = round(sum(bd_projeto$`Increment (%)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto[!(is.na(bd_projeto$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+m6d = round(sum(bd_projeto$`MAI6 Deviation (%)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto[!(is.na(bd_projeto$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+pid = round(sum(bd_projeto$`Previous Inventory Age (yrs.old)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto[!(is.na(bd_projeto$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cid = round(sum(bd_projeto$`Current Inventory Age (yrs.old)` * bd_projeto$`Area (ha)`, na.rm = T) / sum(bd_projeto$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_projeto, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_projeto)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_projeto$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_projeto$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_projeto$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_projeto, df2)
+bd_ytd <- aux %>% 
+            select(names(bd_projeto2))
+
+datatable(bd_ytd, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* CFI = Continuous forest inventory;
+
+* PHI = Pré-Harvest forest inventory;
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+#### Graphic {-}
+
+* Only the top 5 highest IMA6 Current values were selected, considering the Landuse and Planting Year.
+
+> Coppice
+
+```{r projectgraph12, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_ytd %>%
+        filter(Landuse == "Coppice") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_ytd %>%
+        filter(Landuse == "Coppice") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+        ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Implantation
+
+```{r projectgraph22, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+aux <- bd_ytd %>%
+        filter(Landuse == "Implantation") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_ytd %>%
+        filter(Landuse == "Implantation") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+                ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r projectgraph32, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_ytd %>%
+        filter(Landuse == "Replanting") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_ytd %>%
+        filter(Landuse == "Replanting") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+                ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+### Top Projects - YTD {.tabset}
+#### Assumptions {-}
+
+* The three projects with the highest current MAI6 values were selected based on combination of Landuse and Climatic Region;
+
+* The same farm may be present in one or more Landuse classes;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+#### Table {-}
+
+```{r projecttable3, include = TRUE}
+
+bd_projeto3 <- bd_projeto3 %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year", "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+bd_projeto3$`Previous Source` <- ifelse(bd_projeto3$`Previous Source` == "IFC", "CFI", bd_projeto3$`Previous Source`)
+bd_projeto3$`Previous Source` <- ifelse(bd_projeto3$`Previous Source` == "IPC", "PHI", bd_projeto3$`Previous Source`)
+bd_projeto3$`Current Source` <- ifelse(bd_projeto3$`Current Source` == "IFC", "CFI", bd_projeto3$`Current Source`)
+bd_projeto3$`Current Source` <- ifelse(bd_projeto3$`Current Source` == "IPC", "PHI", bd_projeto3$`Current Source`)
+
+pr.v.r = round(sum(bd_projeto3$`Previous Volume - Real (m³.ub/ha)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3[!(is.na(bd_projeto3$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+c.v.r = round(sum(bd_projeto3$`Current Volume - Real (m³.ub/ha)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3$`Area (ha)`),2)
+pm6 = round(sum(bd_projeto3$`Previous MAI6 (m³.ub/ha.yr)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3[!(is.na(bd_projeto3$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cm6 = round(sum(bd_projeto3$`Current MAI6 (m³.ub/ha.yr)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3$`Area (ha)`),2)
+inc = round(sum(bd_projeto3$`Increment (%)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3[!(is.na(bd_projeto3$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+m6d = round(sum(bd_projeto3$`MAI6 Deviation (%)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3[!(is.na(bd_projeto3$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+pid = round(sum(bd_projeto3$`Previous Inventory Age (yrs.old)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3[!(is.na(bd_projeto3$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+cid = round(sum(bd_projeto3$`Current Inventory Age (yrs.old)` * bd_projeto3$`Area (ha)`, na.rm = T) / sum(bd_projeto3$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_projeto3, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_projeto3)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_projeto3$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_projeto3$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_projeto3$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_projeto3, df2)
+
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* CFI = Continuous forest inventory;
+
+* PHI = Pré-Harvest forest inventory;
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+#### Graphic {-}
+
+> Coppice
+
+```{r projectgraph13, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto3 %>%
+        filter(Landuse == "Coppice") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_projeto3 %>%
+        filter(Landuse == "Coppice") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+        ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Implantation
+
+```{r projectgraph23, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto3 %>%
+        filter(Landuse == "Implantation") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+
+bd_projeto3 %>%
+        filter(Landuse == "Implantation") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+                ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+       geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r projectgraph33, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_projeto3 %>%
+        filter(Landuse == "Replanting") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 10) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-"))
+
+bd_projeto3 %>%
+        filter(Landuse == "Replanting") %>%
+        mutate(INDEX_TOP = paste(Landuse, Project, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(13,14)) %>%
+                ggplot(aes(y = Project, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Project, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Project") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Climatic {.tabset}
+### Assumptions {-}
+
+* Total farms measured until February/2023 by Landuse have been used;
+
+* For the calculation of total weighted averages of MAI6 and deviations, only planting years equal to or greater than 2017 were used;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+### Table {-}
+
+```{r climatictable, include = TRUE}
+
+bd_cz <- bd_cz %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year")#, "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+pr.v.r = round(sum(bd_cz$`Previous Volume - Real (m³.ub/ha)` * bd_cz$`Area (ha)`, na.rm = T) / 
+                 sum(bd_cz[!(is.na(bd_cz$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+c.v.r = round(sum(bd_cz$`Current Volume - Real (m³.ub/ha)` * bd_cz$`Area (ha)`, na.rm = T) / 
+                sum(bd_cz$`Area (ha)`),2)
+
+pm6 = round(sum(bd_cz$`Previous MAI6 (m³.ub/ha.yr)` * bd_cz$`Area (ha)`* (bd_cz$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_cz[!(is.na(bd_cz$`Previous Volume - Real (m³.ub/ha)`)) & bd_cz$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cm6 = round(sum(bd_cz$`Current MAI6 (m³.ub/ha.yr)` * bd_cz$`Area (ha)`* (bd_cz$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_cz[bd_cz$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+inc = round(sum(bd_cz$`Increment (%)` * bd_cz$`Area (ha)`, na.rm = T) / 
+              sum(bd_cz[!(is.na(bd_cz$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+m6d = round(sum(bd_cz$`MAI6 Deviation (%)` * bd_cz$`Area (ha)`* (bd_cz$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_cz[!(is.na(bd_cz$`Previous Volume - Real (m³.ub/ha)`)) & bd_cz$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+pid = round(sum(bd_cz$`Previous Inventory Age (yrs.old)` * bd_cz$`Area (ha)`, na.rm = T) / 
+              sum(bd_cz[!(is.na(bd_cz$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+cid = round(sum(bd_cz$`Current Inventory Age (yrs.old)` * bd_cz$`Area (ha)`, na.rm = T) / 
+              sum(bd_cz$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_cz, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_cz)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_cz$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_cz$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_cz$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_cz, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+### Graphic {-}
+
+> Coppice
+
+```{r climaticgraph1, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_cz %>%
+        filter(Landuse == "Coppice") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Climatic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Climatic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Climatic Region") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Implantation
+
+```{r climaticgraph2, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_cz %>%
+        filter(Landuse == "Implantation") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Climatic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+       geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Climatic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Climatic Region") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r climaticgraph3, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_cz %>%
+        filter(Landuse == "Replanting") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Climatic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Climatic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Climatic Region") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Planting Year {.tabset}
+### Assumptions {-}
+
+* Total farms measured until February/2023 by Landuse have been used;
+
+* For the calculation of total weighted averages, only planting years equal to or greater than 2017 were used;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+### Table {-}
+
+```{r pytable, include = TRUE}
+
+bd_plan.yr <- bd_plan.yr %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year")#, "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+pr.v.r = round(sum(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)` * bd_plan.yr$`Area (ha)`, na.rm = T) / 
+                 sum(bd_plan.yr[!(is.na(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+c.v.r = round(sum(bd_plan.yr$`Current Volume - Real (m³.ub/ha)` * bd_plan.yr$`Area (ha)`, na.rm = T) / 
+                sum(bd_plan.yr$`Area (ha)`),2)
+
+pm6 = round(sum(bd_plan.yr$`Previous MAI6 (m³.ub/ha.yr)` * bd_plan.yr$`Area (ha)`* (bd_plan.yr$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_plan.yr[!(is.na(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)`)) & bd_plan.yr$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cm6 = round(sum(bd_plan.yr$`Current MAI6 (m³.ub/ha.yr)` * bd_plan.yr$`Area (ha)`* (bd_plan.yr$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_plan.yr[bd_plan.yr$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+inc = round(sum(bd_plan.yr$`Increment (%)` * bd_plan.yr$`Area (ha)`, na.rm = T) / 
+              sum(bd_plan.yr[!(is.na(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+m6d = round(sum(bd_plan.yr$`MAI6 Deviation (%)` * bd_plan.yr$`Area (ha)`* (bd_plan.yr$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_plan.yr[!(is.na(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)`)) & bd_plan.yr$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+pid = round(sum(bd_plan.yr$`Previous Inventory Age (yrs.old)` * bd_plan.yr$`Area (ha)`, na.rm = T) / 
+              sum(bd_plan.yr[!(is.na(bd_plan.yr$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+cid = round(sum(bd_plan.yr$`Current Inventory Age (yrs.old)` * bd_plan.yr$`Area (ha)`, na.rm = T) / 
+              sum(bd_plan.yr$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_plan.yr, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_plan.yr)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_plan.yr$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_plan.yr$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_plan.yr$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_plan.yr, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+### Graphic {-}
+
+> Coppice
+
+```{r pygraph1, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_plan.yr %>%
+        filter(Landuse == "Coppice") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(10,11)) %>%
+        mutate(Variavel = factor(Variavel, levels = c("Previous MAI6 (m³.ub/ha.yr)", "Current MAI6 (m³.ub/ha.yr)"))) %>%
+        ggplot(aes(x = `Planting year`, y = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(y = match(Valor, sort(unique(Valor))), x = `Planting year`, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), y = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        # facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(breaks = seq(2012, 2021,1)) +
+        scale_y_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#0054A4", "#A2BD30"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = F)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Planting year") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+> Implantation
+
+```{r pygraph2, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_plan.yr %>%
+        filter(Landuse == "Implantation") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(10,11)) %>%
+        mutate(Variavel = factor(Variavel, levels = c("Previous MAI6 (m³.ub/ha.yr)", "Current MAI6 (m³.ub/ha.yr)"))) %>%
+        ggplot(aes(x = `Planting year`, y = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(y = match(Valor, sort(unique(Valor))), x = `Planting year`, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), y = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        # facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(breaks = seq(2012,2021, 1))+
+        scale_y_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#0054A4", "#A2BD30"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = F)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Planting year") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r pygraph3, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+bd_plan.yr %>%
+        filter(Landuse == "Replanting") %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(10,11)) %>%
+        mutate(Variavel = factor(Variavel, levels = c("Previous MAI6 (m³.ub/ha.yr)", "Current MAI6 (m³.ub/ha.yr)"))) %>%
+        ggplot(aes(x = `Planting year`, y = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(y = match(Valor, sort(unique(Valor))), x = `Planting year`, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), y = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        # facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(breaks = seq(2011, 2021, 1)) +
+        scale_y_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#0054A4", "#A2BD30"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = F)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Planting year") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Genetic {.tabset}
+### Assumptions {-}
+
+* Total farms measured until February/2023 by Landuse have been used;
+
+* For the calculation of total weighted averages, only planting years equal to or greater than 2017 were used;
+
+* The decrease in the number of plots between current and previous plot values can be explained by lack of access to the areas.
+
+### Table {-}
+
+```{r gentable, include = TRUE}
+
+bd_genetic <- bd_genetic %>% rename("Area (ha)" = "Area_Ha", 
+                          "Current MAI6 (m³.ub/ha.yr)" = "MAI6.current",
+                          "Previous MAI6 (m³.ub/ha.yr)" = "MAI6.previous",
+                          "Previous Inventory Age (yrs.old)" = "Inventory.Age.previous", 
+                          "Current Inventory Age (yrs.old)" = "Inventory.Age.current",
+                          "Increment (%)" = "Increment.percent",
+                          "MAI6 Deviation (%)" = "MAI6.deviation",
+                          "Previous Volume - Real (m³.ub/ha)" = "Volume.real.previous",
+                          "Current Volume - Real (m³.ub/ha)" = "Volume.real.current",
+                          "Previous plots" = "Previous.plots",
+                          "Current plots" = "Current.plots",
+                          "LRP MAI (m³.ub/ha.yr)" = "LRP.MAI",
+                          "Planting year" = "Planting.year")#, "Previous Source" = "Source.Previous", "Current Source" = "Source.Current", "Project" = "FARM NAME")
+
+pr.v.r = round(sum(bd_genetic$`Previous Volume - Real (m³.ub/ha)` * bd_genetic$`Area (ha)`, na.rm = T) / 
+                 sum(bd_genetic[!(is.na(bd_genetic$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+c.v.r = round(sum(bd_genetic$`Current Volume - Real (m³.ub/ha)` * bd_genetic$`Area (ha)`, na.rm = T) / 
+                sum(bd_genetic$`Area (ha)`),2)
+
+pm6 = round(sum(bd_genetic$`Previous MAI6 (m³.ub/ha.yr)` * bd_genetic$`Area (ha)`* (bd_genetic$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_genetic[!(is.na(bd_genetic$`Previous Volume - Real (m³.ub/ha)`)) & bd_genetic$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+cm6 = round(sum(bd_genetic$`Current MAI6 (m³.ub/ha.yr)` * bd_genetic$`Area (ha)`* (bd_genetic$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_genetic[bd_genetic$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+inc = round(sum(bd_genetic$`Increment (%)` * bd_genetic$`Area (ha)`, na.rm = T) / 
+              sum(bd_genetic[!(is.na(bd_genetic$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+m6d = round(sum(bd_genetic$`MAI6 Deviation (%)` * bd_genetic$`Area (ha)`* (bd_genetic$`Planting year` >= 2017), na.rm = T) / 
+              sum(bd_genetic[!(is.na(bd_genetic$`Previous Volume - Real (m³.ub/ha)`)) & bd_genetic$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+pid = round(sum(bd_genetic$`Previous Inventory Age (yrs.old)` * bd_genetic$`Area (ha)`, na.rm = T) / 
+              sum(bd_genetic[!(is.na(bd_genetic$`Previous Volume - Real (m³.ub/ha)`)),]$`Area (ha)`),2)
+
+cid = round(sum(bd_genetic$`Current Inventory Age (yrs.old)` * bd_genetic$`Area (ha)`, na.rm = T) / 
+              sum(bd_genetic$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(bd_genetic, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(bd_genetic)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(bd_genetic$`Area (ha)`, na.rm = T)
+df2$`Previous plots` <- sum(bd_genetic$`Previous plots`, na.rm = T)
+df2$`Current plots` <- sum(bd_genetic$`Current plots`, na.rm = T)
+df2$`Previous Inventory Age (yrs.old)` <- pid
+df2$`Current Inventory Age (yrs.old)` <- cid
+df2$`Previous Volume - Real (m³.ub/ha)` <-  pr.v.r
+df2$`Current Volume - Real (m³.ub/ha)` <- c.v.r
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Increment (%)` <- inc
+df2$`MAI6 Deviation (%)` <- m6d
+
+aux <- rbind(bd_genetic, df2)
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+<div style="text-align: justify">
+
+Notes: 
+
+* MAI projected to 6 years old, when age < 6;
+
+* The increment was calculated by the differences between current and previous real volumes;
+
+* MAI6 Deviation (%) represents the percentage difference between current and previous MAI6;
+
+* For the total of ages, volumes, MAI, increment and deviation, a weighted average of the column by area was performed, in cases where the column value was null, the area was not included in the weighting.
+
+</div>
+
+### Graphic {-}
+
+* Only the top 5 highest IMA6 Current values were selected, considering the Landuse and Planting Year.
+
+> Coppice
+
+```{r gengraph1, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+aux <- bd_genetic %>%
+        filter(Landuse == "Coppice") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-"))
+
+bd_genetic %>%
+        filter(Landuse == "Coppice") %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Genetic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Genetic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Genetic Material") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Implantation
+
+```{r gengraph2, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+
+aux <- bd_genetic %>%
+        filter(Landuse == "Implantation") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-"))
+
+bd_genetic %>%
+        filter(Landuse == "Implantation") %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Genetic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Genetic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Genetic Material") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+        
+
+```
+
+> Replanting
+
+```{r gengraph3, include = T, fig.align ='center', fig.width = 24, fig.height = 15,  warning = FALSE}
+aux <- bd_genetic %>%
+        filter(Landuse == "Replanting") %>%
+        arrange(Landuse, desc(`Current MAI6 (m³.ub/ha.yr)`), `Planting year`) %>%
+        group_by(Landuse, `Planting year`) %>%
+        slice_head(n = 5) %>%
+        ungroup() %>%
+        as.data.frame() %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-"))
+
+bd_genetic %>%
+        filter(Landuse == "Replanting") %>%
+        mutate(INDEX_TOP = paste(Landuse, Genetic, `Planting year`, sep = "-")) %>%
+        filter(INDEX_TOP %in% unique(aux$INDEX_TOP)) %>%
+        tidyr::gather(key = "Variavel", value = "Valor", c(11,12)) %>%
+        ggplot(aes(y = Genetic, x = Valor, fill = Variavel)) +
+        geom_bar(stat="identity", position = "dodge", width = 0.5) + 
+        geom_text(aes(x = match(Valor, sort(unique(Valor))), y = Genetic, 
+                      label = ifelse(is.na(`MAI6 Deviation (%)`), paste0("-"), 
+                                     paste("Deviation:\n", `MAI6 Deviation (%)`, "%"))), 
+                  data = ~ subset(., Variavel == "Previous MAI6 (m³.ub/ha.yr)"), x = 55,
+                  color = "black", size = 4.5,  fill = "#A6A6A6", vjust = 0.5, hjust = 0.5) +
+        facet_wrap(~`Planting year`, scales = "free_y") + 
+        scale_x_continuous(limits = c(0, 60), breaks = seq(0,60,10))+
+        scale_fill_manual(values=c("#A2BD30", "#0054A4"), name = "MAI 6 yrs.old", guide = guide_legend(reverse = T)) + 
+        labs(x = "MAI6 (m³.ub/ha.yr)", y = "Genetic Material") + 
+        theme_bw() +
+        theme(axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black"),
+        axis.title = element_text(face = "bold", size = 25, color = "black"),
+        axis.text.y = element_text(vjust = 0.5, hjust = 0.5, size = 15, color = "black"),
+        plot.title = element_text(hjust = 0.5, size = 15), legend.position = "right",
+        legend.text = element_text(size = 15, color = "black"),
+        legend.title = element_text(size = 15, color = "black"), panel.grid.major.y = element_blank(),
+        strip.text = element_text(vjust = 0.5, hjust=0.5, size = 15, color = "black")) 
+
+```
+
+## Summary {.tabset}
+
+### Assumptions {-}
+
+* To the total weighted averages of information regarding the LRP and MAI6, only the information with a planting year equal or greater than 2017 was taken into account;
+
+* Coppice Landuse  was not taken into consideration for the information summaries.
+
+### Project {-}
+
+```{r resumegeneral2023proj, include = T}
+
+plnres <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(Project = `FARM NAME`, Climatic = Climática, `Previous Source` = Source.Previous, `Current Source` = Source.Current) %>%
+            summarise(`Measured Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Measured Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Measured Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Measured Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Measured Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~round(.,2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(`Previous Source`), NA)) %>%
+            mutate_at(c("Deviation.area"), ~replace(.,is.na(`Previous Source`), NA))
+          
+aux <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(Project = `FARM NAME`, Climatic = Climática, `Previous Source` = Source.Previous, `Current Source` = Source.Current, `Planting year` = year(Est_Date)) %>%
+            summarise(`Measured Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Measured Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Measured Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Measured Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Measured Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~round(.,2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate_if(sapply(names(.), function(x){grepl("revious", x)}), ~replace(.,is.na(`Previous Source`), NA)) %>%
+            mutate_at(c("Deviation.area"), ~replace(.,is.na(`Previous Source`), NA)) %>%
+          mutate(indexx = paste(Project, Climatic,sep = "-"))
+
+teste <- land2 %>%
+          filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+          group_by(Project, Climatic, `Planting year`) %>%
+          summarise(`Total farm Area (ha)` = sum(`Area (ha)`)) %>% 
+          as.data.frame() %>% 
+          mutate(indexx = paste(Project, Climatic,sep = "-")) %>%
+          filter(indexx %in% unique(aux$indexx)) %>%
+          group_by(Project) %>%
+          summarise(`Total farm Area (ha)` = sum(`Total farm Area (ha)`)) %>%
+          as.data.frame()
+
+plnres <- plnres %>%
+            left_join(teste, by = "Project") %>%
+            select(Project, Climatic, `Total farm Area (ha)`, `Measured Area (ha)`, everything())
+
+plnres$`Previous Source` <- ifelse(plnres$`Previous Source` == "IFC", "CFI", plnres$`Previous Source`)
+plnres$`Previous Source` <- ifelse(plnres$`Previous Source` == "IPC", "PHI", plnres$`Previous Source`)
+plnres$`Current Source` <- ifelse(plnres$`Current Source` == "IFC", "CFI", plnres$`Current Source`)
+plnres$`Current Source` <- ifelse(plnres$`Current Source` == "IPC", "PHI", plnres$`Current Source`)
+
+# pm6 = round(sum(plnres$`Previous MAI6 (m³.ub/ha.yr)` * plnres$`Measured Area (ha)`, na.rm = T) / sum(plnres[!(is.na(plnres$`Previous Source`)),]$`Measured Area (ha)`),2)
+# cm6 = round(sum(plnres$`Current MAI6 (m³.ub/ha.yr)` * plnres$`Measured Area (ha)`, na.rm = T) / sum(plnres$`Measured Area (ha)`),2)
+# m6d = round(sum(plnres$Deviation.area, na.rm = T) / sum(plnres[!(is.na(plnres$`Previous Source`)),]$`Measured Area (ha)`),2)
+# lrpm6  = round(sum(plnres$`LRP MAI (m³.ub/ha.yr)` * plnres$`Measured Area (ha)`, na.rm = T) / sum(plnres$`Measured Area (ha)`),2)
+
+pm6 = round(sum(aux$`Previous MAI6 (m³.ub/ha.yr)` * aux$`Measured Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+              sum(aux[aux$`Planting year` >= 2017 & !is.na(aux$`Previous MAI6 (m³.ub/ha.yr)`),]$`Measured Area (ha)`),2)
+cm6 = round(sum(aux$`Current MAI6 (m³.ub/ha.yr)` * aux$`Measured Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+              sum(aux[aux$`Planting year` >= 2017,]$`Measured Area (ha)`),2)
+m6d = round(sum(aux$Deviation.area* (aux$`Planting year` >= 2017), na.rm = T) / sum(aux[aux$`Planting year` >= 2017 & !is.na(aux$`Previous MAI6 (m³.ub/ha.yr)`),]$`Measured Area (ha)`),2)
+lrpm6  = round(sum(aux$`LRP MAI (m³.ub/ha.yr)` * aux$`Measured Area (ha)`* (aux$`Planting year` >= 2017), na.rm = T) / 
+                 sum(aux[aux$`Planting year` >= 2017,]$`Measured Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnres, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnres)
+df2$Project <- "Total:"
+df2$`Total farm Area (ha)` <- sum(plnres$`Total farm Area (ha)`, na.rm = T)
+df2$`Measured Area (ha)` <- sum(plnres$`Measured Area (ha)`, na.rm = T)
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`Deviation (%)`<- m6d
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+aux <- rbind(plnres, df2) %>% select(-"Deviation.area")
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+
+```
+
+### Planting Year {-}
+
+```{r resumegeneral2023, include = T}
+
+plnres <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(`Planting year` = year(Est_Date)) %>%
+            summarise(`Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate(`Previous MAI6 (m³.ub/ha.yr)` = replace(`Previous MAI6 (m³.ub/ha.yr)`, `Previous MAI6 (m³.ub/ha.yr)` == 0, NA))
+
+pm6 = round(sum(plnres$`Previous MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+cm6 = round(sum(plnres$`Current MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+m6d = round(sum(plnres$Deviation.area* (plnres$`Planting year` >= 2017), na.rm = T) / sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+lrpm6  = round(sum(plnres$`LRP MAI (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(plnres, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(plnres)
+df2$`Planting year` <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+df2$`Deviation (%)`<- m6d
+
+aux <- rbind(plnres, df2) %>% select(-c("Deviation.area", "Previous MAI6 (m³.ub/ha.yr)", "Deviation (%)"))
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+
+```
+
+
+### Climatic {-}
+
+```{r resumegeneral20232, include = T}
+
+aux <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(Climatic = Climática) %>%
+             summarise(`Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate(`Previous MAI6 (m³.ub/ha.yr)` = replace(`Previous MAI6 (m³.ub/ha.yr)`, `Previous MAI6 (m³.ub/ha.yr)` == 0, NA))
+
+plnres <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(`Planting year` = year(Est_Date), Climatic = Climática) %>%
+            summarise(`Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate(`Previous MAI6 (m³.ub/ha.yr)` = replace(`Previous MAI6 (m³.ub/ha.yr)`, `Previous MAI6 (m³.ub/ha.yr)` == 0, NA))
+
+pm6 = round(sum(plnres$`Previous MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+cm6 = round(sum(plnres$`Current MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+m6d = round(sum(plnres$Deviation.area* (plnres$`Planting year` >= 2017), na.rm = T) / sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+lrpm6  = round(sum(plnres$`LRP MAI (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(aux, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(aux)
+df2$Climatic <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+df2$`Deviation (%)`<- m6d
+
+aux <- rbind(aux, df2) %>% select(-c("Deviation.area", "Previous MAI6 (m³.ub/ha.yr)", "Deviation (%)"))
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
+
+### Landuse {-}
+
+```{r resumegeneral20233, include = T}
+
+aux <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(Landuse) %>%
+             summarise(`Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate(`Previous MAI6 (m³.ub/ha.yr)` = replace(`Previous MAI6 (m³.ub/ha.yr)`, `Previous MAI6 (m³.ub/ha.yr)` == 0, NA))
+
+plnres <- bd2023 %>%
+            filter(Landuse != "Coppice", Ownership != "Tree Farm", Ownership != "Wood Purchase", Land2 != "Purchase") %>%
+            group_by(`Planting year` = year(Est_Date), Landuse) %>%
+            summarise(`Area (ha)` = sum(Area_Ha, na.rm = T),
+                      `LRP MAI (m³.ub/ha.yr)` = sum(LRP.MAI.Area, na.rm = T) /  `Area (ha)`, 
+                      `Previous MAI6 (m³.ub/ha.yr)` = sum(MAI6.previous.Area, na.rm = T) /  `Area (ha)`,
+                      `Current MAI6 (m³.ub/ha.yr)` = sum(MAI6.current.Area, na.rm = T) /  `Area (ha)`,
+                      `Deviation (%)` = round(((`Current MAI6 (m³.ub/ha.yr)` - `Previous MAI6 (m³.ub/ha.yr)`)/`Previous MAI6 (m³.ub/ha.yr)`)*100,2),
+                      Deviation.area = `Deviation (%)` * `Area (ha)`) %>% 
+            as.data.frame() %>%
+            mutate_if(is.numeric, ~round(., 2)) %>%
+            mutate_if(is.numeric, ~replace(., is.infinite(.), NA)) %>%
+            mutate(`Previous MAI6 (m³.ub/ha.yr)` = replace(`Previous MAI6 (m³.ub/ha.yr)`, `Previous MAI6 (m³.ub/ha.yr)` == 0, NA))
+
+pm6 = round(sum(plnres$`Previous MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+cm6 = round(sum(plnres$`Current MAI6 (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+              sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+m6d = round(sum(plnres$Deviation.area* (plnres$`Planting year` >= 2017), na.rm = T) / sum(plnres[plnres$`Planting year` >= 2017 & !is.na(plnres$`Previous MAI6 (m³.ub/ha.yr)`),]$`Area (ha)`),2)
+lrpm6  = round(sum(plnres$`LRP MAI (m³.ub/ha.yr)` * plnres$`Area (ha)`* (plnres$`Planting year` >= 2017), na.rm = T) / 
+                 sum(plnres[plnres$`Planting year` >= 2017,]$`Area (ha)`),2)
+
+df2 <- data.frame(lapply(aux, function(x) {NA}), stringsAsFactors = F)
+names(df2) <- names(aux)
+df2$Landuse <- "Total:"
+df2$`Area (ha)` <- sum(plnres$`Area (ha)`, na.rm = T)
+df2$`Previous MAI6 (m³.ub/ha.yr)` <- pm6
+df2$`Current MAI6 (m³.ub/ha.yr)` <- cm6
+df2$`LRP MAI (m³.ub/ha.yr)` <- lrpm6
+df2$`Deviation (%)`<- m6d
+
+aux <- rbind(aux, df2) %>% select(-c("Deviation.area", "Previous MAI6 (m³.ub/ha.yr)", "Deviation (%)"))
+
+datatable(aux, class = 'cell-border', options = list(buttons = c('excel','copy'), 
+                                                                 pageLength = 10, sDom = '<"top">frt<"bottom">ipB', 
+                                                                 scrollY = 300, scroller = TRUE, scrollX = T), 
+                                                                 extensions = 'Buttons')
+```
